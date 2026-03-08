@@ -31,6 +31,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#define __int8_t_defined
 
 /*===========================================================================
  * Common error codes  (ErrorCode field on all blocks)
