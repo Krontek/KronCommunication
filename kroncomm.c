@@ -115,7 +115,10 @@ uint16_t KRON_ModbusRTU_BuildRequest(uint8_t        *buf,
 
     /* --- Write Multiple Registers: Addr(2) + Qty(2) + ByteCount(1) + Data --- */
     case MODBUS_FC_WRITE_MULTIPLE_REGISTERS: {
-        if (!writeData || quantity == 0u || quantity > KRONCOMM_MODBUS_MAX_REGS)
+        /* Spec limit for FC16 is 123 registers (not 125 as for reads): the
+         * request frame also carries Addr+Qty+ByteCount, so 125 would push a
+         * 259-byte ADU into a 256-byte RTU buffer. */
+        if (!writeData || quantity == 0u || quantity > KRONCOMM_MODBUS_MAX_WRITE_REGS)
             return 0u;
         put16(buf, &off, startAddr);
         put16(buf, &off, quantity);
@@ -173,6 +176,12 @@ uint8_t KRON_ModbusRTU_ParseResponse(const uint8_t *buf,
         if (len < 5u) return KRONCOMM_ERR_FRAME;
         uint8_t  byteCount = buf[2];
         uint16_t off       = 3u;
+
+        /* The byte count is attacker/peer controlled — it must agree exactly
+         * with the frame we actually received (Addr+FC+BC + data + CRC),
+         * otherwise we would read past the end of the frame into adjacent or
+         * stale buffer memory and report it as valid data. */
+        if ((uint16_t)byteCount + 5u != len) return KRONCOMM_ERR_FRAME;
 
         if (expectedFC == MODBUS_FC_READ_COILS ||
             expectedFC == MODBUS_FC_READ_DISCRETE_INPUTS)
@@ -265,16 +274,25 @@ uint8_t KRON_ModbusTCP_ParseResponse(const uint8_t *buf,
 {
     if (!buf || len < 8u) return KRONCOMM_ERR_FRAME;
 
+    /* len is the number of bytes actually received from the socket and is
+     * therefore peer controlled. Reject anything that cannot be a legal TCP
+     * ADU before it reaches the fixed-size synth[] buffer below. */
+    if (len > KRONCOMM_MODBUS_TCP_FRAME_SIZE) return KRONCOMM_ERR_FRAME;
+
     if (exceptionCode) *exceptionCode = 0u;
 
     /* Validate MBAP */
     uint16_t transId   = ((uint16_t)buf[0] << 8u) | buf[1];
     uint16_t protoId   = ((uint16_t)buf[2] << 8u) | buf[3];
+    uint16_t mbapLen   = ((uint16_t)buf[4] << 8u) | buf[5];
     uint8_t  unitId    = buf[6];
     uint8_t  fc        = buf[7];
 
     if (transId != expectedTransId) return KRONCOMM_ERR_FRAME;
     if (protoId != 0x0000u)        return KRONCOMM_ERR_FRAME;
+    /* MBAP length counts UnitId + PDU, so the full ADU is mbapLen + 6 bytes. */
+    if (mbapLen < 2u)              return KRONCOMM_ERR_FRAME;
+    if ((uint16_t)(mbapLen + 6u) != len) return KRONCOMM_ERR_FRAME;
     if (unitId  != expectedUnitId) return KRONCOMM_ERR_FRAME;
 
     /* Exception response */
@@ -287,7 +305,6 @@ uint8_t KRON_ModbusTCP_ParseResponse(const uint8_t *buf,
     /* Re-use RTU parser on a synthetic frame [unitId + tcp_payload + dummy_crc].
      * We build a fake RTU buffer from the TCP payload and add a correct CRC. */
     uint8_t  synth[KRONCOMM_MODBUS_TCP_FRAME_SIZE + 2u];
-    uint16_t payloadLen = (uint16_t)(len - 6u);  /* skip 6-byte MBAP */
     /* buf[6] = unit ID (already placed as synth[0]).
      * buf[7..] = FC + PDU data.  Skip buf[6] to avoid duplicating unit ID. */
     synth[0] = unitId;

@@ -38,11 +38,11 @@ static void test_crc16(void)
     check("CRC: empty → 0xFFFF", KRON_CRC16_Modbus(NULL, 0) == 0xFFFFu
           || KRON_CRC16_Modbus((const uint8_t*)"", 0) == 0xFFFFu);
 
-    /* Known vector: 0B 03 00 6B 00 03 → 0x8776 */
+    /* Known vector: 0B 03 00 6B 00 03 → 0xBD74 (appended on the wire as 74 BD) */
     {
         uint8_t frame[] = {0x0Bu, 0x03u, 0x00u, 0x6Bu, 0x00u, 0x03u};
         uint16_t crc = KRON_CRC16_Modbus(frame, 6u);
-        check("CRC: known vector 0B 03 00 6B 00 03 → 0x8776", crc == 0x8776u);
+        check("CRC: known vector 0B 03 00 6B 00 03 → 0xBD74", crc == 0xBD74u);
     }
 
     /* Single byte 0x01 */
@@ -119,9 +119,9 @@ static void test_rtu_build(void)
         uint16_t wd[3] = {0x0001u, 0x0002u, 0x0003u};
         uint16_t len = KRON_ModbusRTU_BuildRequest(buf, 1u,
                            MODBUS_FC_WRITE_MULTIPLE_REGISTERS, 0x0000u, 3u, wd);
-        /* Frame: addr + FC + AddrHi + AddrLo + QtyHi + QtyLo + ByteCount +
-         *         6 data bytes + 2 CRC = 13 bytes */
-        check("RTU Build FC16: length = 13", len == 13u);
+        /* Frame: addr(1) + FC(1) + Addr(2) + Qty(2) + ByteCount(1) +
+         *        6 data bytes + CRC(2) = 15 bytes */
+        check("RTU Build FC16: length = 15", len == 15u);
         check("RTU Build FC16: FC",           buf[1] == 0x10u);
         check("RTU Build FC16: byte count",   buf[6] == 0x06u);
         check("RTU Build FC16: reg0 hi",      buf[7] == 0x00u);
@@ -459,6 +459,98 @@ static void test_stubs(void)
 }
 
 /* =========================================================================
+ * Regression tests — hardening fixes
+ * ========================================================================= */
+static void test_hardening(void)
+{
+    printf("\n--- Hardening / bounds ---\n");
+
+    /* FC16: spec limit is 123 registers, not 125 — 125 would build a
+     * 259-byte ADU into a 256-byte RTU buffer. */
+    {
+        uint16_t wd[KRONCOMM_MODBUS_MAX_REGS] = {0};
+        uint8_t  b[KRONCOMM_MODBUS_RTU_FRAME_SIZE];
+        check("FC16: qty 123 accepted",
+              KRON_ModbusRTU_BuildRequest(b, 1u, MODBUS_FC_WRITE_MULTIPLE_REGISTERS,
+                                          0u, 123u, wd) == 255u);
+        check("FC16: qty 124 rejected",
+              KRON_ModbusRTU_BuildRequest(b, 1u, MODBUS_FC_WRITE_MULTIPLE_REGISTERS,
+                                          0u, 124u, wd) == 0u);
+        check("FC16: qty 125 rejected",
+              KRON_ModbusRTU_BuildRequest(b, 1u, MODBUS_FC_WRITE_MULTIPLE_REGISTERS,
+                                          0u, 125u, wd) == 0u);
+    }
+
+    /* RTU parse: a byte count that disagrees with the received length must be
+     * rejected, not trusted into a read past the end of the frame. */
+    {
+        /* Well-formed FC03 reply, 2 registers */
+        uint8_t f[16] = {0x01u, 0x03u, 0x04u, 0x00u, 0x0Au, 0x00u, 0x0Bu};
+        uint16_t crc = KRON_CRC16_Modbus(f, 7u);
+        f[7] = (uint8_t)(crc & 0xFFu);
+        f[8] = (uint8_t)(crc >> 8u);
+        uint16_t rd[8] = {0};
+        check("RTU parse: valid FC03 accepted",
+              KRON_ModbusRTU_ParseResponse(f, 9u, 1u, 0x03u, rd, 8u, NULL)
+              == KRONCOMM_OK);
+        check("RTU parse: FC03 data reg0", rd[0] == 0x000Au);
+        check("RTU parse: FC03 data reg1", rd[1] == 0x000Bu);
+
+        /* Same length, but claiming 250 data bytes — CRC recomputed so the
+         * frame is self-consistent; only the length cross-check catches it. */
+        f[2] = 250u;
+        crc  = KRON_CRC16_Modbus(f, 7u);
+        f[7] = (uint8_t)(crc & 0xFFu);
+        f[8] = (uint8_t)(crc >> 8u);
+        check("RTU parse: oversized byte count rejected",
+              KRON_ModbusRTU_ParseResponse(f, 9u, 1u, 0x03u, rd, 8u, NULL)
+              == KRONCOMM_ERR_FRAME);
+    }
+
+    /* TCP parse: an over-long frame must be rejected before it is copied into
+     * the fixed-size synth buffer, and the MBAP length must match. */
+    {
+        uint8_t big[600];
+        uint16_t rd[8] = {0};
+        memset(big, 0, sizeof(big));
+        big[0] = 0x00u; big[1] = 0x01u;          /* transaction id */
+        big[2] = 0x00u; big[3] = 0x00u;          /* protocol id    */
+        big[4] = 0x02u; big[5] = 0x1Au;          /* length = 538   */
+        big[6] = 0x01u;                          /* unit id        */
+        big[7] = 0x03u;                          /* function code  */
+        big[8] = 0xFFu;                          /* byte count     */
+        check("TCP parse: over-long frame rejected",
+              KRON_ModbusTCP_ParseResponse(big, 544u, 1u, 1u, 0x03u, rd, 8u, NULL)
+              == KRONCOMM_ERR_FRAME);
+
+        /* Legal size, but MBAP length field disagrees with the byte count */
+        big[4] = 0x00u; big[5] = 0x63u;          /* claims 99 bytes */
+        check("TCP parse: MBAP length mismatch rejected",
+              KRON_ModbusTCP_ParseResponse(big, 11u, 1u, 1u, 0x03u, rd, 8u, NULL)
+              == KRONCOMM_ERR_FRAME);
+    }
+
+    /* TCP round trip still works after the added validation. */
+    {
+        uint8_t f[KRONCOMM_MODBUS_TCP_FRAME_SIZE];
+        uint16_t rd[4] = {0};
+        f[0] = 0x12u; f[1] = 0x34u;              /* transaction id */
+        f[2] = 0x00u; f[3] = 0x00u;              /* protocol id    */
+        f[4] = 0x00u; f[5] = 0x07u;              /* unit + 6 PDU   */
+        f[6] = 0x0Bu;                            /* unit id        */
+        f[7] = 0x03u;                            /* FC03           */
+        f[8] = 0x04u;                            /* byte count     */
+        f[9]  = 0x11u; f[10] = 0x22u;
+        f[11] = 0x33u; f[12] = 0x44u;
+        check("TCP parse: valid frame accepted",
+              KRON_ModbusTCP_ParseResponse(f, 13u, 0x1234u, 0x0Bu, 0x03u,
+                                           rd, 4u, NULL) == KRONCOMM_OK);
+        check("TCP parse: reg0", rd[0] == 0x1122u);
+        check("TCP parse: reg1", rd[1] == 0x3344u);
+    }
+}
+
+/* =========================================================================
  * main
  * ========================================================================= */
 int main(void)
@@ -469,6 +561,7 @@ int main(void)
     test_tcp();
     test_structs();
     test_stubs();
+    test_hardening();
 
     printf("%d passed, %d failed\n", pass_count, fail_count);
     return fail_count == 0 ? 0 : 1;

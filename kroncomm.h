@@ -71,7 +71,10 @@
 #define MODBUS_EX_MEMORY_PARITY_ERROR      0x08u
 
 /* Buffer / data-model limits */
-#define KRONCOMM_MODBUS_MAX_REGS        125u  /* max registers per request (spec limit) */
+#define KRONCOMM_MODBUS_MAX_REGS        125u  /* max registers per READ request (spec limit) */
+#define KRONCOMM_MODBUS_MAX_WRITE_REGS  123u  /* max registers per FC10 write (spec limit;
+                                               * lower than read because the request frame
+                                               * also carries Addr+Qty+ByteCount) */
 #define KRONCOMM_MODBUS_RTU_FRAME_SIZE  256u  /* max RTU ADU bytes */
 #define KRONCOMM_MODBUS_TCP_FRAME_SIZE  260u  /* max TCP ADU bytes (6 MBAP + 254 PDU) */
 #define KRONCOMM_MODBUS_SLAVE_COILS_SIZE 128u /* slave data model — coil/discrete count */
